@@ -1,0 +1,139 @@
+#Determinants of skin cancer phenotype
+
+from __future__ import annotations
+
+import argparse
+import urllib.request
+from pathlib import Path
+
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    average_precision_score,
+    balanced_accuracy_score,
+    classification_report,
+    confusion_matrix,
+    roc_auc_score,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+
+BASE_URL = "https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2015/DataFiles"
+DEQ_FEATURES = ["DEQ034A", "DEQ034C", "DEQ034D", "DEQ038G", "DEQ038Q"]
+CANCER_TYPE_COLUMNS = ["MCQ230A", "MCQ230B", "MCQ230C", "MCQ230D"]
+SKIN_CANCER_CODES = {25, 32}  # Melanoma; skin (non-melanoma)
+
+
+def download_if_missing(path: Path, filename: str) -> Path:
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        url = f"{BASE_URL}/{filename}"
+        print(f"Downloading {url}")
+        urllib.request.urlretrieve(url, path)
+    return path
+
+
+def make_target(mcq: pd.DataFrame) -> pd.Series:
+    """Label reported skin cancer; leave unknown or refused histories unlabeled."""
+    cancer_ever = pd.to_numeric(mcq["MCQ220"], errors="coerce")
+    cancer_types = mcq[CANCER_TYPE_COLUMNS].apply(pd.to_numeric, errors="coerce")
+    has_skin_cancer = cancer_types.isin(SKIN_CANCER_CODES).any(axis=1)
+    has_known_cancer_type = cancer_types.apply(lambda column: column.between(1, 40)).any(axis=1)
+
+    target = pd.Series(np.nan, index=mcq.index, dtype="float64")
+    target.loc[cancer_ever.eq(2)] = 0
+    target.loc[cancer_ever.eq(1) & has_known_cancer_type] = 0
+    target.loc[cancer_ever.eq(1) & has_skin_cancer] = 1
+    return target
+
+
+def read_xpt(path: Path) -> pd.DataFrame:
+    return pd.read_sas(path, format="xport", encoding="utf-8")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--deq-file", type=Path, default=Path("data/DEQ_I.XPT"))
+    parser.add_argument("--mcq-file", type=Path, default=Path("data/MCQ_I.XPT"))
+    parser.add_argument("--model-output", type=Path, default=Path("skin_cancer_mlp.joblib"))
+    parser.add_argument("--test-size", type=float, default=0.25)
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+
+    deq_path = download_if_missing(args.deq_file, "DEQ_I.XPT")
+    mcq_path = download_if_missing(args.mcq_file, "MCQ_I.XPT")
+    deq = read_xpt(deq_path)
+    mcq = read_xpt(mcq_path)
+
+    missing_deq = sorted(set(DEQ_FEATURES) - set(deq.columns))
+    missing_mcq = sorted({"SEQN", "MCQ220", *CANCER_TYPE_COLUMNS} - set(mcq.columns))
+    if missing_deq or missing_mcq:
+        raise ValueError(f"Missing DEQ columns: {missing_deq}; missing MCQ columns: {missing_mcq}")
+
+    data = deq[["SEQN", *DEQ_FEATURES]].merge(
+        mcq[["SEQN", "MCQ220", *CANCER_TYPE_COLUMNS]], on="SEQN", how="inner", validate="one_to_one"
+    )
+    data[DEQ_FEATURES] = data[DEQ_FEATURES].apply(pd.to_numeric, errors="coerce")
+    data[["DEQ034A", "DEQ034C", "DEQ034D", "DEQ038G"]] = data[
+        ["DEQ034A", "DEQ034C", "DEQ034D", "DEQ038G"]
+    ].replace([7, 9], np.nan)
+    data["DEQ038Q"] = data["DEQ038Q"].replace([77, 99], np.nan)
+    data["target"] = make_target(data)
+    data = data.dropna(subset=["target"])
+    data = data.loc[data[DEQ_FEATURES].notna().any(axis=1)]
+
+    X = data[DEQ_FEATURES]
+    y = data["target"].astype("int64")
+    class_counts = y.value_counts()
+    if len(class_counts) != 2 or class_counts.min() < 2:
+        raise ValueError(f"Need at least two labeled participants per class; found {class_counts.to_dict()}")
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=args.test_size, random_state=args.seed, stratify=y
+    )
+    train_counts = y_train.value_counts()
+    sample_weights = y_train.map(
+        {label: len(y_train) / (2 * count) for label, count in train_counts.items()}
+    )
+    model = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median", add_indicator=True)),
+            ("scaler", StandardScaler()),
+            (
+                "dnn",
+                MLPClassifier(
+                    hidden_layer_sizes=(32, 16),
+                    activation="relu",
+                    solver="adam",
+                    early_stopping=True,
+                    max_iter=1000,
+                    random_state=args.seed,
+                ),
+            ),
+        ]
+    )
+    model.fit(X_train, y_train, dnn__sample_weight=sample_weights)
+    predictions = model.predict(X_test)
+    probabilities = model.predict_proba(X_test)[:, 1]
+
+    print(f"Labeled participants: {len(data)} (skin cancer: {int(y.sum())}, no: {int((y == 0).sum())})")
+    print(f"Test balanced accuracy: {balanced_accuracy_score(y_test, predictions):.3f}")
+    print(f"Test ROC AUC: {roc_auc_score(y_test, probabilities):.3f}")
+    print(f"Test average precision: {average_precision_score(y_test, probabilities):.3f}")
+    print("Test confusion matrix (true rows, predicted columns):")
+    print(confusion_matrix(y_test, predictions, labels=[0, 1]))
+    print(classification_report(y_test, predictions, labels=[0, 1], zero_division=0))
+
+    args.model_output.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(model, args.model_output)
+    print(f"Saved model to {args.model_output}")
+    print("Interpretation: predicts a self-reported prior diagnosis, not future cancer risk or a clinical diagnosis.")
+
+
+if __name__ == "__main__":
+    main()
